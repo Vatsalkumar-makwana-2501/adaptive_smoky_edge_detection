@@ -20,7 +20,7 @@ BSDS500/
 │   └── test/
 │       ├── 123.jpg
 │       └── ...
-└── groundTruth/
+└── ground_truth/
     └── test/
         ├── 123.mat
         └── ...
@@ -100,7 +100,7 @@ The model evaluates edge detection performance using the following metrics:
 ```
 ├── BSDS500/
 │   ├── images/
-│   └── groundTruth/
+│   └── ground_truth/
 ├── Adaptive_Edge_Detection_Complete.ipynb
 ├── requirements.txt
 └── README.md
