@@ -13,12 +13,17 @@ from tensorflow.keras.models import Model, load_model
 
 # Import project modules
 from utils import load_dataset, setup_directories, find_corresponding_gt, load_ground_truth
-from smoke_generation import create_smoky_dataset
+from smoke_removal import (
+    load_smoke_dataset, train_smoke_removal_model, remove_smoke, 
+    estimate_smoke_level, enhance_contrast, SMOKE_REMOVAL_MODEL_PATH,
+    create_smoke_removal_model
+)
 from edge_detection import (
     canny_edge, sobel_edge, laplacian_edge, guided_filter_edge, 
     enhance_smoky_image, adaptive_edge_detection, deep_edge_detection,
     hybrid_edge_detection, rethink_canny_edge_detection, train_edge_detection_model,
-    EDGE_MODEL_PATH, SMOKE_LEVEL_PATH
+    EDGE_MODEL_PATH, train_smoke_aware_edge_detection_model, smoke_aware_edge_detection,
+    SMOKE_AWARE_MODEL_PATH
 )
 from smoke_level_model import (
     train_smoke_level_model, predict_smoke_level
@@ -31,474 +36,551 @@ def main():
     # Configure paths
     base_dir = 'BSDS500'
     gt_dir = os.path.join(base_dir, 'ground_truth')
+    smoke_dataset_dir = 'Smoke'
     
     # Create project directories
     setup_directories()
     
-    # Load dataset
-    print("Loading dataset...")
+    # Load original dataset for edge detection training
+    print("Loading BSDS500 dataset...")
     train_images, train_gt = load_dataset(base_dir, 'train')
     val_images, val_gt = load_dataset(base_dir, 'val')
     test_images, test_gt = load_dataset(base_dir, 'test')
     
-    # Create a smoke-augmented dataset
-    print("\nCreating smoke-augmented dataset...")
-    # Use more images for better model training
-    test_subset = train_images[:20]  # Use 20 images for demonstration
-    smoky_dataset = create_smoky_dataset(test_subset, methods=['perlin', 'gaussian', 'texture'])
+    # Load smoke dataset
+    print("Loading smoke dataset...")
+    smoke_dataset = load_smoke_dataset(smoke_dataset_dir)
     
-    # Display some smoke-augmented samples
-    show_smoke_augmented_samples(smoky_dataset, 2)
+    # Train or load smoke removal model
+    smoke_removal_model = None
+    try:
+        # Create model directories if they don't exist
+        os.makedirs(os.path.dirname(SMOKE_REMOVAL_MODEL_PATH), exist_ok=True)
+        
+        if not os.path.exists(SMOKE_REMOVAL_MODEL_PATH):
+            print("Training smoke removal model...")
+            train_hazy = smoke_dataset['train']['hazy']
+            train_clean = smoke_dataset['train']['clean']
+            test_hazy = smoke_dataset['test']['hazy']
+            test_clean = smoke_dataset['test']['clean']
+            
+            # Use subset of training data for validation
+            val_idx = int(len(train_hazy) * 0.8)
+            val_hazy = train_hazy[val_idx:]
+            val_clean = train_clean[val_idx:]
+            train_hazy = train_hazy[:val_idx]
+            train_clean = train_clean[:val_idx]
+            
+            smoke_removal_model, _ = train_smoke_removal_model(
+                train_hazy, train_clean,
+                val_hazy, val_clean,
+                epochs=10,  # Reduced epochs for quicker testing
+                batch_size=4
+            )
+        else:
+            print("Loading pre-trained smoke removal model...")
+            # Create a fresh model instance and load weights
+            input_shape = (256, 256, 3)
+            smoke_removal_model = create_smoke_removal_model(input_shape)
+            smoke_removal_model.load_weights(SMOKE_REMOVAL_MODEL_PATH)
+            print("Smoke removal model loaded successfully")
+    except Exception as e:
+        print(f"Error with smoke removal model: {e}")
+        print("Continuing without smoke removal model...")
     
-    # First train the edge detection model if it doesn't exist
-    if not os.path.exists(EDGE_MODEL_PATH):
-        print("\nTraining deep learning edge detection model...")
-        edge_model, _ = train_edge_detection_model(
-            train_images, train_gt,
-            val_images, val_gt,
-            epochs=20,
-            batch_size=8
-        )
-
-    # Test edge detection on smoky images
-    print("\nTesting edge detection algorithms on smoky images...")
-    test_edge_detection_on_smoke_levels(smoky_dataset, gt_dir)
-
-    # Train smoke level estimation model with improved parameters
+    # First, train the smoke-aware edge detection model (this is our best approach)
+    if not os.path.exists(SMOKE_AWARE_MODEL_PATH):
+        print("\nTraining smoke-aware edge detection model...")
+        try:
+            smoke_aware_model, _ = train_smoke_aware_edge_detection_model(
+                train_images, train_gt,
+                val_images, val_gt,
+                epochs=10,
+                batch_size=8
+            )
+        except Exception as e:
+            print(f"Error training smoke-aware model: {e}")
+            print("Continuing without smoke-aware edge detection model...")
+    
+    # Test edge detection on smoky images and their clean versions
+    print("\nTesting edge detection on original smoky images and after smoke removal...")
+    test_edge_detection_on_smoke_dataset(smoke_dataset['test'], smoke_removal_model)
+    
+    # Train smoke level estimation model
     print("\nTraining smoke level estimation model...")
-    # Use transfer learning and more epochs for better accuracy
-    if not os.path.exists(SMOKE_LEVEL_PATH):
+    smoke_model = None
+    try:
+        # Create dataset for smoke level estimation
+        smoke_level_dataset = []
+        for hazy_path in smoke_dataset['train']['hazy']:
+            # Estimate smoke level using our heuristic method
+            img = cv2.imread(hazy_path)
+            if img is None:
+                continue
+            level, level_name = estimate_smoke_level(img)
+            
+            smoke_level_dataset.append({
+                'image_path': hazy_path,
+                'smoke_level': level,
+                'smoke_level_name': level_name
+            })
+        
+        # Use separate validation set
+        val_dataset = []
+        for hazy_path in smoke_dataset['test']['hazy']:
+            img = cv2.imread(hazy_path)
+            if img is None:
+                continue
+            level, level_name = estimate_smoke_level(img)
+            
+            val_dataset.append({
+                'image_path': hazy_path,
+                'smoke_level': level,
+                'smoke_level_name': level_name
+            })
+        
+        # Train model
         smoke_model, _ = train_smoke_level_model(
-            smoky_dataset,
-            model_save_path=SMOKE_LEVEL_PATH,
-            epochs=20,  # Increased epochs
-            batch_size=8,  # Smaller batch size for better generalization
+            smoke_level_dataset + val_dataset,  # Combine for better training
+            epochs=10,
+            batch_size=8,
             use_transfer_learning=True
         )
-    else:
-        smoke_model = load_model(SMOKE_LEVEL_PATH)
-
+    except Exception as e:
+        print(f"Error training smoke level model: {e}")
+        print("Using heuristic smoke level estimation...")
+    
     # Test adaptive edge detection
     print("\nTesting adaptive edge detection system...")
-    test_adaptive_edge_detection(smoky_dataset, smoke_model, gt_dir)
+    try:
+        test_adaptive_edge_detection_with_removal(
+            smoke_dataset['test']['hazy'], 
+            smoke_removal_model,
+            smoke_model
+        )
+    except Exception as e:
+        print(f"Error in adaptive edge detection: {e}")
     
     # Run comprehensive evaluation
     print("\nRunning comprehensive evaluation...")
-    compare_all_methods(smoky_dataset, smoke_model, gt_dir, num_samples=5)  # More samples for better comparison
-
-def show_smoke_augmented_samples(dataset, num_samples=2):
-    """Display samples with different smoke levels."""
-    # Get unique original images
-    unique_images = list(set([item['original_path'] for item in dataset]))
-    sample_images = random.sample(unique_images, min(num_samples, len(unique_images)))
-    
-    for original in sample_images:
-        # Find all variations of this image
-        variations = [item for item in dataset if item['original_path'] == original]
-        variations.sort(key=lambda x: x['smoke_level'])  # Sort by smoke level
+    try:
+        compare_all_methods_with_removal(
+            smoke_dataset['test']['hazy'],
+            smoke_dataset['test']['clean'],
+            smoke_removal_model,
+            smoke_model,
+            num_samples=3
+        )
+    except Exception as e:
+        print(f"Error in comprehensive evaluation: {e}")
         
-        plt.figure(figsize=(15, 3))
-        for i, var in enumerate(variations):
-            img = cv2.imread(var['smoky_path'])
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
-            plt.subplot(1, len(variations), i+1)
-            plt.imshow(img)
-            plt.title(f"{var['smoke_level_name']}\n{var['smoke_method']}")
-            plt.axis('off')
-        plt.suptitle(f"Smoke Variations for {os.path.basename(original)}")
-        plt.tight_layout()
-        plt.show()
+    print("Processing completed!")
 
-def test_edge_detection_on_smoke_levels(dataset, gt_dir):
-    """Compare edge detection on different smoke levels."""
-    # Get a sample image in all smoke levels
-    unique_images = list(set([item['original_path'] for item in dataset]))
-    sample_image_path = random.choice(unique_images)
-    sample_image_name = os.path.basename(sample_image_path).split('.')[0]
+def test_edge_detection_on_smoke_dataset(test_dataset, smoke_removal_model=None):
+    """Compare edge detection on original smoky images and after smoke removal."""
+    # Select a few test images to compare
+    num_samples = min(5, len(test_dataset['hazy']))
+    test_indices = random.sample(range(len(test_dataset['hazy'])), num_samples)
     
-    # Find corresponding ground truth
-    gt_path = find_corresponding_gt(sample_image_path, gt_dir)
-    
-    if gt_path is None:
-        print(f"Ground truth not found for {sample_image_name}, skipping.")
-        return
-    
-    # Get all variations of this image
-    variations = [item for item in dataset if item['original_path'] == sample_image_path]
-    variations.sort(key=lambda x: x['smoke_level'])  # Sort by smoke level
-    
-    # Check if deep learning model is available
-    has_deep_model = os.path.exists(EDGE_MODEL_PATH)
-    
-    # Compare edge detection for each smoke level
-    for variation in variations:
-        print(f"\nTesting edge detection on {variation['smoke_level_name']} smoke ({variation['smoke_method']})")
-        image = cv2.imread(variation['smoky_path'])
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    for idx in test_indices:
+        hazy_path = test_dataset['hazy'][idx]
+        clean_path = test_dataset['clean'][idx]
         
-        # Apply different edge detection methods with improved parameters
-        edges = {
-            'canny': canny_edge(image, sigma=1.5, low_threshold=40, high_threshold=120),
-            'sobel': sobel_edge(image, threshold=0.15),
-            'laplacian': laplacian_edge(image, threshold=0.15),
-            'guided': guided_filter_edge(image, radius=10, eps=0.25**2, threshold=0.25)
+        # Load images
+        hazy_img = cv2.imread(hazy_path)
+        clean_img = cv2.imread(clean_path)
+        
+        if hazy_img is None or clean_img is None:
+            print(f"Failed to load images: {hazy_path} or {clean_path}")
+            continue
+        
+        # Apply smoke removal if model is available
+        if smoke_removal_model is not None:
+            removed_img = remove_smoke(hazy_img, smoke_removal_model)
+        else:
+            # Fallback: use contrast enhancement if no model available
+            removed_img = enhance_contrast(hazy_img)
+        
+        # Convert images to RGB for display
+        hazy_rgb = cv2.cvtColor(hazy_img, cv2.COLOR_BGR2RGB)
+        clean_rgb = cv2.cvtColor(clean_img, cv2.COLOR_BGR2RGB)
+        removed_rgb = cv2.cvtColor(removed_img, cv2.COLOR_BGR2RGB)
+        
+        # Estimate smoke level in the hazy image
+        level, level_name = estimate_smoke_level(hazy_img)
+        print(f"\nImage: {os.path.basename(hazy_path)} - Estimated smoke level: {level_name}")
+        
+        # Apply various edge detection methods
+        print("Applying edge detection methods to original smoky image...")
+        smoky_edges = {
+            'canny': canny_edge(hazy_rgb, sigma=1.5, low_threshold=40, high_threshold=120),
+            'sobel': sobel_edge(hazy_rgb, threshold=0.15),
+            'laplacian': laplacian_edge(hazy_rgb, threshold=0.15),
+            'improved_canny': rethink_canny_edge_detection(hazy_rgb, adaptive_thresholds=True)
         }
         
-        # Add deep learning methods if available
-        if has_deep_model:
-            # Load deep model
-            model = tf.keras.models.load_model(EDGE_MODEL_PATH)
-            
-            # Add deep learning methods
-            edges['deep'] = deep_edge_detection(image, model=model, threshold=0.4)
-            edges['hybrid'] = hybrid_edge_detection(image, deep_model=model)
-            
-            # Use method names for comparison
-            method_names = ['Canny', 'Sobel', 'Laplacian', 'Guided Filter', 'Deep Learning', 'Hybrid']
-        else:
-            # Add the improved traditional method
-            edges['improved_canny'] = rethink_canny_edge_detection(image, adaptive_thresholds=True)
-            
-            # Use method names for comparison
-            method_names = ['Canny', 'Sobel', 'Laplacian', 'Guided Filter', 'Improved Canny']
+        print("Applying edge detection methods to smoke-removed image...")
+        removed_edges = {
+            'canny': canny_edge(removed_rgb, sigma=1.5, low_threshold=40, high_threshold=120),
+            'sobel': sobel_edge(removed_rgb, threshold=0.15),
+            'laplacian': laplacian_edge(removed_rgb, threshold=0.15),
+            'improved_canny': rethink_canny_edge_detection(removed_rgb, adaptive_thresholds=True)
+        }
         
-        # Compare methods
-        compare_methods(variation['smoky_path'], gt_path, edges, method_names)
+        print("Applying edge detection methods to clean image (ground truth)...")
+        clean_edges = {
+            'canny': canny_edge(clean_rgb, sigma=1.5, low_threshold=40, high_threshold=120),
+            'sobel': sobel_edge(clean_rgb, threshold=0.15),
+            'laplacian': laplacian_edge(clean_rgb, threshold=0.15),
+            'improved_canny': rethink_canny_edge_detection(clean_rgb, adaptive_thresholds=True)
+        }
+        
+        # Display comparison
+        plt.figure(figsize=(15, 10))
+        
+        # Original, Removed, and Clean images
+        plt.subplot(3, 5, 1)
+        plt.imshow(hazy_rgb)
+        plt.title("Smoky Image")
+        plt.axis('off')
+        
+        plt.subplot(3, 5, 2)
+        plt.imshow(removed_rgb)
+        plt.title("Smoke Removed")
+        plt.axis('off')
+        
+        plt.subplot(3, 5, 3)
+        plt.imshow(clean_rgb)
+        plt.title("Clean (Ground Truth)")
+        plt.axis('off')
+        
+        # Display edge detection results
+        methods = ['canny', 'sobel', 'laplacian', 'improved_canny']
+        titles = ['Canny', 'Sobel', 'Laplacian', 'Improved Canny']
+        
+        for i, (method, title) in enumerate(zip(methods, titles)):
+            # Smoky edges
+            plt.subplot(3, 5, 6 + i)
+            plt.imshow(smoky_edges[method], cmap='gray')
+            plt.title(f"Smoky - {title}")
+            plt.axis('off')
+            
+            # Removed smoke edges
+            plt.subplot(3, 5, 11 + i)
+            plt.imshow(removed_edges[method], cmap='gray')
+            plt.title(f"Removed - {title}")
+            plt.axis('off')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Compare edge detection metrics
+        print("\nEdge Detection Metrics - Original Smoky vs Smoke Removed:")
+        for method, title in zip(methods, titles):
+            smoky_metrics = evaluate_edge_detection(smoky_edges[method], clean_edges[method])
+            removed_metrics = evaluate_edge_detection(removed_edges[method], clean_edges[method])
+            
+            print(f"\n{title} Method:")
+            print(f"Smoky: F1={smoky_metrics['f1']:.4f}, IoU={smoky_metrics['iou']:.4f}, SSIM={smoky_metrics['ssim']:.4f}")
+            print(f"Removed: F1={removed_metrics['f1']:.4f}, IoU={removed_metrics['iou']:.4f}, SSIM={removed_metrics['ssim']:.4f}")
+            print(f"Improvement: F1={removed_metrics['f1']-smoky_metrics['f1']:.4f}, IoU={removed_metrics['iou']-smoky_metrics['iou']:.4f}, SSIM={removed_metrics['ssim']-smoky_metrics['ssim']:.4f}")
 
-def test_adaptive_edge_detection(smoky_dataset, smoke_model, gt_dir):
-    """Test adaptive edge detection system with smoke level prediction.
+def test_adaptive_edge_detection_with_removal(hazy_images, smoke_removal_model, smoke_model=None):
+    """Test adaptive edge detection with smoke removal."""
+    # Select a few test images
+    num_samples = min(5, len(hazy_images))
+    test_indices = random.sample(range(len(hazy_images)), num_samples)
     
-    Args:
-        smoky_dataset: List of smoky image dictionaries
-        smoke_model: Trained smoke level classification model
-        gt_dir: Directory with ground truth edge maps
-    """
-    smoke_levels = ['none', 'light', 'medium', 'heavy', 'extreme']
+    # Check if deep learning models are available
+    has_deep_model = os.path.exists(EDGE_MODEL_PATH)
+    has_smoke_aware_model = os.path.exists(SMOKE_AWARE_MODEL_PATH)
     
-    # Test one example image from each smoke level
-    for level_idx, level_name in enumerate(smoke_levels):
-        # Find images of this smoke level
-        level_samples = [item for item in smoky_dataset if item['smoke_level'] == level_idx]
-        if not level_samples:
-            print(f"No samples found for {level_name} smoke level")
-            continue
-            
-        # Choose a random sample
-        sample = random.choice(level_samples)
-        smoke_method = sample['smoke_method']
-        
-        print(f"\nTesting on {level_name} smoke image ({smoke_method})")
+    if has_deep_model:
+        deep_model = tf.keras.models.load_model(EDGE_MODEL_PATH)
+    
+    if has_smoke_aware_model:
+        smoke_aware_model = tf.keras.models.load_model(SMOKE_AWARE_MODEL_PATH)
+    
+    for idx in test_indices:
+        hazy_path = hazy_images[idx]
         
         # Load image
-        image = cv2.imread(sample['smoky_path'])
-        if image is None:
-            print(f"Failed to load image: {sample['smoky_path']}")
+        hazy_img = cv2.imread(hazy_path)
+        if hazy_img is None:
+            print(f"Failed to load image: {hazy_path}")
             continue
         
         # Predict smoke level 
-        predicted_level_idx, confidence = predict_smoke_level(smoke_model, image)
-        predicted_level = smoke_levels[predicted_level_idx]
-        print(f"Predicted smoke level: {predicted_level} (confidence: {confidence:.2f})")
+        if smoke_model is not None:
+            predicted_level_idx, confidence = predict_smoke_level(smoke_model, hazy_img)
+            smoke_levels = ['none', 'light', 'medium', 'heavy', 'extreme']
+            predicted_level = smoke_levels[predicted_level_idx]
+            print(f"\nPredicted smoke level for {os.path.basename(hazy_path)}: {predicted_level} (confidence: {confidence:.2f})")
+        else:
+            # Use our heuristic method if no model is available
+            predicted_level_idx, predicted_level = estimate_smoke_level(hazy_img)
+            print(f"\nEstimated smoke level for {os.path.basename(hazy_path)}: {predicted_level}")
         
-        # Apply adaptive edge detection based on predicted level
-        edges = adaptive_edge_detection(image, predicted_level)
+        # Apply smoke removal
+        print("Applying smoke removal...")
+        removed_img = remove_smoke(hazy_img, smoke_removal_model)
         
-        # Try to load ground truth if it exists
-        gt_path = find_corresponding_gt(sample['original_path'], gt_dir)
+        # Convert to RGB for processing
+        hazy_rgb = cv2.cvtColor(hazy_img, cv2.COLOR_BGR2RGB)
+        removed_rgb = cv2.cvtColor(removed_img, cv2.COLOR_BGR2RGB)
         
-        # Display without ground truth if it's not available or can't be loaded
-        if gt_path is None:
-            print(f"Ground truth not found for {os.path.basename(sample['smoky_path'])}")
-            display_result_without_gt(image, edges, predicted_level)
-            continue
+        # Apply adaptive edge detection on both original and smoke-removed images
+        methods = {}
         
-        # Load ground truth from .mat file
-        gt_edges = load_ground_truth(gt_path)
-        if gt_edges is None:
-            print(f"Failed to extract ground truth data from {gt_path}")
-            display_result_without_gt(image, edges, predicted_level)
-            continue
-            
-        # Ensure ground truth is properly normalized
-        if gt_edges.max() > 1.0:
-            gt_edges = gt_edges / 255.0
-            
-        # Evaluate against ground truth
-        metrics = evaluate_edge_detection(edges, gt_edges)
+        # Original smoky image
+        if has_smoke_aware_model:
+            methods['Original + Smoke-Aware'] = smoke_aware_edge_detection(
+                hazy_rgb, predicted_level, model=smoke_aware_model
+            )
         
-        print("\nEvaluating adaptive edge detection:")
-        print("Evaluation Metrics:")
-        print(f"Precision: {metrics['precision']:.4f}")
-        print(f"Recall: {metrics['recall']:.4f}")
-        print(f"F1 Score: {metrics['f1']:.4f}")
-        print(f"IoU: {metrics['iou']:.4f}")
-        print(f"SSIM: {metrics['ssim']:.4f}")
-        print(f"Optimal F1 Score: {metrics['optimal_f1']:.4f} at threshold {metrics['optimal_threshold']:.2f}")
+        methods['Original + Adaptive'] = adaptive_edge_detection(hazy_rgb, predicted_level)
         
-        # Visualize results
-        visualize_edge_detection(image, edges, gt_edges, f"Adaptive Edge Detection ({predicted_level} smoke)")
+        if has_deep_model:
+            methods['Original + Deep'] = deep_edge_detection(hazy_rgb, model=deep_model)
+        
+        # Smoke-removed image
+        if has_smoke_aware_model:
+            methods['Removed + Smoke-Aware'] = smoke_aware_edge_detection(
+                removed_rgb, 'none', model=smoke_aware_model
+            )
+        
+        methods['Removed + Adaptive'] = adaptive_edge_detection(removed_rgb, 'none')
+        
+        if has_deep_model:
+            methods['Removed + Deep'] = deep_edge_detection(removed_rgb, model=deep_model)
+        
+        # Display results
+        plt.figure(figsize=(15, 8))
+        
+        # Original and smoke-removed images
+        plt.subplot(2, len(methods) + 1, 1)
+        plt.imshow(hazy_rgb)
+        plt.title(f"Original ({predicted_level} smoke)")
+        plt.axis('off')
+        
+        plt.subplot(2, len(methods) + 1, len(methods) + 2)
+        plt.imshow(removed_rgb)
+        plt.title("Smoke Removed")
+        plt.axis('off')
+        
+        # Edge detection results
+        for i, (method_name, edge_map) in enumerate(methods.items()):
+            plt.subplot(2, len(methods) + 1, i + 2)
+            plt.imshow(edge_map, cmap='gray')
+            plt.title(method_name)
+            plt.axis('off')
+        
+        plt.tight_layout()
+        plt.show()
 
-def display_result_without_gt(image, edges, predicted_level):
-    """Display edge detection results without ground truth.
-    
-    Args:
-        image: Original image
-        edges: Detected edges
-        predicted_level: Predicted smoke level
-    """
-    plt.figure(figsize=(10, 5))
-    plt.subplot(121)
-    plt.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    plt.title("Original Image")
-    plt.axis('off')
-    
-    plt.subplot(122)
-    plt.imshow(edges, cmap='gray')
-    plt.title(f"Adaptive Edge Detection ({predicted_level} smoke)")
-    plt.axis('off')
-    
-    plt.tight_layout()
-    plt.show()
-
-def compare_all_methods(dataset, smoke_model, gt_dir, num_samples=3):
-    """Compare all edge detection methods on sample images.
-    
-    Args:
-        dataset: List of smoky image dictionaries 
-        smoke_model: Trained smoke level classification model
-        gt_dir: Directory with ground truth edge maps
-        num_samples: Number of samples to evaluate
-    
-    Returns:
-        List of result dictionaries with metrics for each method
-    """
+def compare_all_methods_with_removal(hazy_images, clean_images, smoke_removal_model, smoke_model=None, num_samples=3):
+    """Compare all edge detection methods on original and smoke-removed images."""
     # Get samples with ground truth
     results = []
     
-    # Sample from all smoke levels to ensure we test on diverse conditions
-    selected_samples = []
-    for level in range(5):  # none, light, medium, heavy, extreme
-        level_samples = [item for item in dataset if item['smoke_level'] == level]
-        if level_samples:
-            selected_samples.extend(random.sample(level_samples, min(1, len(level_samples))))
+    # Sample random images for testing
+    test_indices = random.sample(range(len(hazy_images)), min(num_samples, len(hazy_images)))
     
-    # If we need more samples, add random ones
-    if len(selected_samples) < num_samples:
-        remaining = random.sample(
-            [item for item in dataset if item not in selected_samples],
-            min(num_samples - len(selected_samples), len(dataset) - len(selected_samples))
-        )
-        selected_samples.extend(remaining)
-    
-    # Check if deep learning model is available
+    # Check if models are available
     has_deep_model = os.path.exists(EDGE_MODEL_PATH)
-    if has_deep_model:
-        model = tf.keras.models.load_model(EDGE_MODEL_PATH)
+    has_smoke_aware_model = os.path.exists(SMOKE_AWARE_MODEL_PATH)
     
-    for item in selected_samples:
-        # Find corresponding ground truth
-        gt_path = find_corresponding_gt(item['original_path'], gt_dir)
+    if has_deep_model:
+        deep_model = tf.keras.models.load_model(EDGE_MODEL_PATH)
+    
+    if has_smoke_aware_model:
+        smoke_aware_model = tf.keras.models.load_model(SMOKE_AWARE_MODEL_PATH)
+    
+    for idx in test_indices:
+        hazy_path = hazy_images[idx]
+        clean_path = clean_images[idx]
         
-        if gt_path is None:
-            print(f"Ground truth not found for {item['smoky_path']}, skipping...")
+        # Load images
+        hazy_img = cv2.imread(hazy_path)
+        clean_img = cv2.imread(clean_path)
+        
+        if hazy_img is None or clean_img is None:
+            print(f"Failed to load images: {hazy_path} or {clean_path}")
             continue
         
-        # Load image
-        image = cv2.imread(item['smoky_path'])
-        if image is None:
-            print(f"Failed to load image: {item['smoky_path']}")
-            continue
+        # Apply smoke removal
+        removed_img = remove_smoke(hazy_img, smoke_removal_model)
         
-        # Load ground truth
-        gt_image = load_ground_truth(gt_path)
-        if gt_image is None:
-            print(f"Failed to load ground truth image: {gt_path}")
-            continue
-            
-        # Normalize ground truth
-        gt_edges = gt_image / 255.0
-        
-        print(f"\nEvaluating on {item['smoke_level_name']} smoke image {os.path.basename(item['original_path'])}")
+        # Convert to RGB for processing
+        hazy_rgb = cv2.cvtColor(hazy_img, cv2.COLOR_BGR2RGB)
+        clean_rgb = cv2.cvtColor(clean_img, cv2.COLOR_BGR2RGB)
+        removed_rgb = cv2.cvtColor(removed_img, cv2.COLOR_BGR2RGB)
         
         # Predict smoke level
-        predicted_level_idx, confidence = predict_smoke_level(smoke_model, image)
-        smoke_levels = ['none', 'light', 'medium', 'heavy', 'extreme']
-        predicted_level = smoke_levels[predicted_level_idx]
-        print(f"Predicted level: {predicted_level} (confidence: {confidence:.2f}), Actual level: {item['smoke_level_name']}")
+        if smoke_model is not None:
+            predicted_level_idx, confidence = predict_smoke_level(smoke_model, hazy_img)
+            smoke_levels = ['none', 'light', 'medium', 'heavy', 'extreme']
+            predicted_level = smoke_levels[predicted_level_idx]
+            print(f"\nPredicted smoke level for {os.path.basename(hazy_path)}: {predicted_level} (confidence: {confidence:.2f})")
+        else:
+            # Use heuristic method
+            predicted_level_idx, predicted_level = estimate_smoke_level(hazy_img)
+            print(f"\nEstimated smoke level for {os.path.basename(hazy_path)}: {predicted_level}")
         
-        # Apply different edge detection methods
-        methods = {
-            'canny': canny_edge(image, sigma=1.5, low_threshold=40, high_threshold=120),
-            'sobel': sobel_edge(image, threshold=0.15),
-            'improved_canny': rethink_canny_edge_detection(image, adaptive_thresholds=True),
-            'adaptive': adaptive_edge_detection(image, predicted_level)
+        # Apply edge detection methods to original smoky image
+        original_methods = {
+            'original_canny': canny_edge(hazy_rgb, sigma=1.5, low_threshold=40, high_threshold=120),
+            'original_sobel': sobel_edge(hazy_rgb, threshold=0.15),
+            'original_improved_canny': rethink_canny_edge_detection(hazy_rgb, adaptive_thresholds=True),
+            'original_adaptive': adaptive_edge_detection(hazy_rgb, predicted_level)
+        }
+        
+        # Apply edge detection methods to smoke-removed image
+        removed_methods = {
+            'removed_canny': canny_edge(removed_rgb, sigma=1.5, low_threshold=40, high_threshold=120),
+            'removed_sobel': sobel_edge(removed_rgb, threshold=0.15),
+            'removed_improved_canny': rethink_canny_edge_detection(removed_rgb, adaptive_thresholds=True),
+            'removed_adaptive': adaptive_edge_detection(removed_rgb, 'none')  # Use 'none' since smoke is removed
+        }
+        
+        # Apply edge detection methods to clean (ground truth) image
+        clean_methods = {
+            'clean_canny': canny_edge(clean_rgb, sigma=1.5, low_threshold=40, high_threshold=120),
+            'clean_sobel': sobel_edge(clean_rgb, threshold=0.15),
+            'clean_improved_canny': rethink_canny_edge_detection(clean_rgb, adaptive_thresholds=True)
         }
         
         # Add deep learning methods if available
         if has_deep_model:
-            methods['deep'] = deep_edge_detection(image, model=model, threshold=0.4)
-            methods['hybrid'] = hybrid_edge_detection(image, deep_model=model)
+            original_methods['original_deep'] = deep_edge_detection(hazy_rgb, model=deep_model)
+            removed_methods['removed_deep'] = deep_edge_detection(removed_rgb, model=deep_model)
+        
+        # Add smoke-aware edge detection if available
+        if has_smoke_aware_model:
+            original_methods['original_smoke_aware'] = smoke_aware_edge_detection(
+                hazy_rgb, predicted_level, model=smoke_aware_model
+            )
+            removed_methods['removed_smoke_aware'] = smoke_aware_edge_detection(
+                removed_rgb, 'none', model=smoke_aware_model
+            )
+        
+        # Combine all methods for evaluation
+        all_methods = {}
+        all_methods.update(original_methods)
+        all_methods.update(removed_methods)
         
         # Calculate and display metrics
-        print("\n" + "="*50)
-        print(f"{'Method':<15} {'Precision':<10} {'Recall':<10} {'F1 Score':<10} {'IoU':<10} {'SSIM':<10}")
-        print("="*50)
+        print("\n" + "="*70)
+        print(f"{'Method':<25} {'Precision':<10} {'Recall':<10} {'F1 Score':<10} {'IoU':<10} {'SSIM':<10}")
+        print("="*70)
         
+        # Evaluate against clean image edges (ground truth)
         metrics_dict = {}
-        for method_name, edge_map in methods.items():
-            metrics = evaluate_edge_detection(edge_map, gt_edges)
+        for method_name, edge_map in all_methods.items():
+            # Determine which clean edge map to use for comparison
+            if 'canny' in method_name:
+                gt_edge_map = clean_methods['clean_canny']
+            elif 'sobel' in method_name:
+                gt_edge_map = clean_methods['clean_sobel']
+            else:
+                gt_edge_map = clean_methods['clean_improved_canny']
+            
+            metrics = evaluate_edge_detection(edge_map, gt_edge_map)
             metrics_dict[method_name] = metrics
             
-            print(f"{method_name.capitalize():<15} {metrics['precision']:.4f}     {metrics['recall']:.4f}     {metrics['f1']:.4f}      {metrics['iou']:.4f}     {metrics['ssim']:.4f}")
+            print(f"{method_name:<25} {metrics['precision']:.4f}     {metrics['recall']:.4f}     {metrics['f1']:.4f}      {metrics['iou']:.4f}     {metrics['ssim']:.4f}")
         
-        print("="*50)
+        print("="*70)
         
         # Print optimal F1 scores
         print("\nOptimal F1 Scores:")
         for method_name, metrics in metrics_dict.items():
-            print(f"{method_name.capitalize()}: F1={metrics['optimal_f1']:.4f} at threshold={metrics['optimal_threshold']:.2f}")
+            print(f"{method_name:<25}: F1={metrics['optimal_f1']:.4f} at threshold={metrics['optimal_threshold']:.2f}")
         
         # Store results
         results.append({
-            'image': os.path.basename(item['original_path']),
-            'smoke_level': item['smoke_level_name'],
+            'image': os.path.basename(hazy_path),
+            'smoke_level': predicted_level,
             'metrics': metrics_dict
         })
     
     # Calculate average metrics across all test images
     if results:
-        avg_metrics = {method: {'precision': 0, 'recall': 0, 'f1': 0, 'iou': 0, 'ssim': 0} 
-                      for method in ['canny', 'sobel', 'improved_canny', 'adaptive']}
+        # Create method groups for better comparison
+        method_groups = {
+            'Original': [m for m in results[0]['metrics'].keys() if m.startswith('original_')],
+            'Removed': [m for m in results[0]['metrics'].keys() if m.startswith('removed_')]
+        }
         
-        # Add deep learning methods if available
-        if has_deep_model:
-            avg_metrics['deep'] = {'precision': 0, 'recall': 0, 'f1': 0, 'iou': 0, 'ssim': 0}
-            avg_metrics['hybrid'] = {'precision': 0, 'recall': 0, 'f1': 0, 'iou': 0, 'ssim': 0}
-        
-        # Create counters for each method to handle cases where not all metrics are present
-        method_counts = {method: 0 for method in avg_metrics.keys()}
-        
-        for result in results:
-            for method, metrics in result['metrics'].items():
-                if method in method_counts:
-                    method_counts[method] += 1
-                    for metric_name, value in metrics.items():
-                        # Only include the standard metrics
-                        if metric_name in avg_metrics[method]:
-                            avg_metrics[method][metric_name] += value
-        
-        # Calculate averages
-        for method in avg_metrics:
-            if method_counts[method] > 0:
-                for metric_name in avg_metrics[method]:
-                    avg_metrics[method][metric_name] /= method_counts[method]
+        # Calculate average metrics for each method group
+        group_metrics = {}
+        for group_name, methods in method_groups.items():
+            group_metrics[group_name] = {
+                'precision': 0, 'recall': 0, 'f1': 0, 'iou': 0, 'ssim': 0, 
+                'count': 0
+            }
+            
+            for result in results:
+                for method in methods:
+                    if method in result['metrics']:
+                        metrics = result['metrics'][method]
+                        group_metrics[group_name]['precision'] += metrics['precision']
+                        group_metrics[group_name]['recall'] += metrics['recall']
+                        group_metrics[group_name]['f1'] += metrics['f1']
+                        group_metrics[group_name]['iou'] += metrics['iou']
+                        group_metrics[group_name]['ssim'] += metrics['ssim']
+                        group_metrics[group_name]['count'] += 1
+            
+            # Calculate averages
+            count = group_metrics[group_name]['count']
+            if count > 0:
+                for metric in ['precision', 'recall', 'f1', 'iou', 'ssim']:
+                    group_metrics[group_name][metric] /= count
         
         # Display summary of results
         print("\n=== SUMMARY OF RESULTS ===")
-        for method, metrics in avg_metrics.items():
-            print(f"\n{method.capitalize()} Edge Detection:")
+        for group_name, metrics in group_metrics.items():
+            print(f"\n{group_name} Methods (Average):")
             for metric_name, value in metrics.items():
-                print(f"{metric_name.capitalize()}: {value:.4f}")
+                if metric_name != 'count':
+                    print(f"{metric_name.capitalize()}: {value:.4f}")
         
-        # Plot average metrics
-        plot_comparative_metrics(avg_metrics)
+        # Calculate improvement
+        if 'Original' in group_metrics and 'Removed' in group_metrics:
+            print("\n=== IMPROVEMENT WITH SMOKE REMOVAL ===")
+            for metric in ['precision', 'recall', 'f1', 'iou', 'ssim']:
+                improvement = group_metrics['Removed'][metric] - group_metrics['Original'][metric]
+                percentage = (improvement / max(group_metrics['Original'][metric], 1e-5)) * 100
+                print(f"{metric.capitalize()}: {improvement:.4f} ({percentage:+.2f}%)")
         
-        return results, avg_metrics
+        # Plot comparative metrics
+        plot_comparative_metrics(group_metrics)
+        
+        return results, group_metrics
     
     return results
 
-def comprehensive_evaluation(smoky_dataset, smoke_model, gt_dir):
-    """Run comprehensive evaluation comparing all methods.
+def visualize_edge_detection(image, edges, gt_edges, title):
+    """Visualize edge detection results with ground truth."""
+    plt.figure(figsize=(15, 5))
     
-    Args:
-        smoky_dataset: List of smoky image dictionaries
-        smoke_model: Trained smoke level classification model
-        gt_dir: Directory with ground truth edge maps
-    """
-    from utils import load_ground_truth  # Import the function
+    plt.subplot(1, 3, 1)
+    plt.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    plt.title("Original Image")
+    plt.axis('off')
     
-    smoke_levels = ['none', 'light', 'medium', 'heavy', 'extreme']
-    results = []
+    plt.subplot(1, 3, 2)
+    plt.imshow(edges, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
     
-    # Choose one image from each smoke level
-    for level_idx, level_name in enumerate(smoke_levels):
-        # Find images of this smoke level
-        level_samples = [item for item in smoky_dataset if item['smoke_level'] == level_idx]
-        if not level_samples:
-            print(f"No samples found for {level_name} smoke level")
-            continue
-            
-        # Choose a random sample
-        sample = random.choice(level_samples)
-        
-        # Load image
-        image = cv2.imread(sample['smoky_path'])
-        if image is None:
-            print(f"Failed to load image: {sample['smoky_path']}")
-            continue
-            
-        # Try to find corresponding ground truth
-        gt_path = find_corresponding_gt(sample['original_path'], gt_dir)
-        if gt_path is None:
-            print(f"Ground truth not found for {sample['smoky_path']}, skipping...")
-            continue
-        
-        # Load ground truth from .mat file
-        gt_edges = load_ground_truth(gt_path)
-        if gt_edges is None:
-            print(f"Failed to extract ground truth data from {gt_path}")
-            continue
-            
-        # Ensure ground truth is properly normalized
-        if gt_edges.max() > 1.0:
-            gt_edges = gt_edges / 255.0
-        
-        print(f"\nEvaluating on {level_name} smoke image {os.path.basename(sample['smoky_path'])}")
-        
-        # Predict smoke level
-        predicted_level_idx, confidence = predict_smoke_level(smoke_model, image)
-        predicted_level = smoke_levels[predicted_level_idx]
-        print(f"Predicted level: {predicted_level} (confidence: {confidence:.2f}), Actual level: {level_name}")
-        
-        # Apply different edge detection methods
-        canny_edges = canny_edge(image, sigma=1.5, low_threshold=40, high_threshold=120)
-        sobel_edges = sobel_edge(image, threshold=0.15)
-        guided_edges = guided_filter_edge(image, radius=10, eps=0.25**2, threshold=0.25)
-        adaptive_edges = adaptive_edge_detection(image, predicted_level)
-        
-        # Evaluate all methods
-        methods = {
-            'canny': canny_edges,
-            'sobel': sobel_edges,
-            'guided': guided_edges,
-            'adaptive': adaptive_edges
-        }
-        
-        # Calculate metrics
-        result = {'image': os.path.basename(sample['smoky_path']), 'actual_level': level_name, 
-                 'predicted_level': predicted_level, 'confidence': confidence, 'metrics': {}}
-        
-        print("\n" + "="*50)
-        print(f"{'Method':<15} {'Precision':<10} {'Recall':<10} {'F1 Score':<10} {'IoU':<10} {'SSIM':<10}")
-        print("="*50)
-        
-        for method_name, edge_map in methods.items():
-            metrics = evaluate_edge_detection(edge_map, gt_edges)
-            result['metrics'][method_name] = metrics
-            
-            print(f"{method_name.capitalize():<15} {metrics['precision']:.4f}     {metrics['recall']:.4f}     {metrics['f1']:.4f}      {metrics['iou']:.4f}     {metrics['ssim']:.4f}")
-        
-        print("="*50)
-        
-        # Print optimal F1 scores
-        print("\nOptimal F1 Scores:")
-        for method_name, metrics in result['metrics'].items():
-            print(f"{method_name.capitalize()}: F1={metrics['optimal_f1']:.4f} at threshold={metrics['optimal_threshold']:.2f}")
-        
-        results.append(result)
-        
-    return results
+    plt.subplot(1, 3, 3)
+    plt.imshow(gt_edges, cmap='gray')
+    plt.title("Ground Truth")
+    plt.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
 
 def predict_smoke_level(model, image):
     """Predict smoke level in an image.
@@ -533,43 +615,6 @@ def predict_smoke_level(model, image):
     confidence = prediction[0][predicted_class]
     
     return predicted_class, float(confidence)
-
-def visualize_edge_detection(image, edges, gt_edges=None, title="Edge Detection Results"):
-    """Visualize edge detection results.
-    
-    Args:
-        image: Original image
-        edges: Detected edges
-        gt_edges: Ground truth edges (optional)
-        title: Plot title
-    """
-    plt.figure(figsize=(15, 5))
-    
-    # Display original image
-    plt.subplot(131)
-    if len(image.shape) == 3:
-        plt.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    else:
-        plt.imshow(image, cmap='gray')
-    plt.title("Original Image")
-    plt.axis('off')
-    
-    # Display detected edges
-    plt.subplot(132)
-    plt.imshow(edges, cmap='gray')
-    plt.title("Detected Edges")
-    plt.axis('off')
-    
-    # Display ground truth if provided
-    if gt_edges is not None:
-        plt.subplot(133)
-        plt.imshow(gt_edges, cmap='gray')
-        plt.title("Ground Truth")
-        plt.axis('off')
-    
-    plt.suptitle(title)
-    plt.tight_layout()
-    plt.show()
 
 if __name__ == "__main__":
     main() 

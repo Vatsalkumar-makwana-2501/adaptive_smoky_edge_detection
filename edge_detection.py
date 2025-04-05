@@ -10,9 +10,10 @@ from scipy import ndimage
 import tensorflow as tf
 from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.layers import Input, Conv2D, BatchNormalization, Activation, MaxPooling2D
-from tensorflow.keras.layers import Concatenate, UpSampling2D, Dropout
+from tensorflow.keras.layers import Concatenate, UpSampling2D, Dropout, Dense, GlobalAveragePooling2D, Reshape, Multiply
 import os
 from utils import load_ground_truth
+from smoke_generation import apply_smoke_effect
 
 # Check if OpenCV contrib modules are available
 has_ximgproc = True
@@ -25,6 +26,9 @@ except AttributeError:
 # Path to save/load the model
 EDGE_MODEL_PATH = 'models/edge_detection_model.h5'
 SMOKE_LEVEL_PATH = 'models/smoke_level_model.h5'
+
+# Path to save/load the smoke-aware model
+SMOKE_AWARE_MODEL_PATH = 'models/smoke_aware_edge_model.h5'
 
 def canny_edge(image, sigma=1.0, low_threshold=50, high_threshold=150):
     """Apply Canny edge detection to an image.
@@ -373,7 +377,7 @@ def create_dense_edge_detection_model(input_shape=(256, 256, 3)):
     return model
 
 def train_edge_detection_model(train_images, train_gt, val_images=None, val_gt=None, 
-                              epochs=20, batch_size=8):
+                              epochs=20, batch_size=8, smoke_augmentation=True):
     """Train the deep edge detection model.
     
     Args:
@@ -383,12 +387,14 @@ def train_edge_detection_model(train_images, train_gt, val_images=None, val_gt=N
         val_gt: List of validation ground truth edge map paths (optional)
         epochs: Number of training epochs
         batch_size: Batch size for training
+        smoke_augmentation: Whether to apply smoke augmentation during training
         
     Returns:
         Trained model
     """
     from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
     from tensorflow.keras.preprocessing.image import ImageDataGenerator
+    from smoke_generation import apply_smoke_effect
     
     # Create model
     model = create_dense_edge_detection_model()
@@ -397,26 +403,63 @@ def train_edge_detection_model(train_images, train_gt, val_images=None, val_gt=N
     X_train = []
     y_train = []
     
-    for img_path, gt_path in zip(train_images, train_gt):
+    print(f"Loading and processing {len(train_images)} training images...")
+    
+    for i, (img_path, gt_path) in enumerate(zip(train_images, train_gt)):
+        if i % 20 == 0:
+            print(f"Processing image {i}/{len(train_images)}")
+            
         # Load and preprocess image
         img = cv2.imread(img_path)
+        if img is None:
+            print(f"Failed to load image: {img_path}")
+            continue
+            
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (256, 256))
-        img = img.astype(np.float32) / 255.0
         
         # Load and preprocess ground truth
         gt = load_ground_truth(gt_path)
         if gt is None:
+            print(f"Failed to load ground truth: {gt_path}")
             continue
-        gt = cv2.resize(gt, (256, 256))
-        gt = gt.astype(np.float32) / 255.0
-        gt = np.expand_dims(gt, axis=-1)
+            
+        # Resize images to model input size
+        img_resized = cv2.resize(img, (256, 256))
+        gt_resized = cv2.resize(gt, (256, 256))
         
-        X_train.append(img)
-        y_train.append(gt)
+        # Normalize to 0-1 range
+        img_norm = img_resized.astype(np.float32) / 255.0
+        gt_norm = gt_resized.astype(np.float32) / 255.0
+        gt_norm = np.expand_dims(gt_norm, axis=-1)  # Add channel dimension
+        
+        # Add the original clean image and its ground truth
+        X_train.append(img_norm)
+        y_train.append(gt_norm)
+        
+        # If smoke augmentation is enabled, add smoky versions of the image
+        if smoke_augmentation:
+            # Generate different smoke levels
+            smoke_levels = [1, 2, 3, 4]  # light, medium, heavy, extreme
+            smoke_methods = ['perlin', 'gaussian', 'texture']
+            
+            # Add smoky versions with the same ground truth
+            for level in smoke_levels:
+                for method in smoke_methods[:1]:  # Use just one method to avoid too many images
+                    # Apply smoke effect
+                    smoky_img = apply_smoke_effect(img, level, method)
+                    
+                    # Resize and normalize
+                    smoky_resized = cv2.resize(smoky_img, (256, 256))
+                    smoky_norm = smoky_resized.astype(np.float32) / 255.0
+                    
+                    # Add to training data
+                    X_train.append(smoky_norm)
+                    y_train.append(gt_norm)  # Same ground truth
     
     X_train = np.array(X_train)
     y_train = np.array(y_train)
+    
+    print(f"Created training dataset with {len(X_train)} images")
     
     # Prepare validation data if provided
     validation_data = None
@@ -424,36 +467,56 @@ def train_edge_detection_model(train_images, train_gt, val_images=None, val_gt=N
         X_val = []
         y_val = []
         
+        print(f"Loading and processing {len(val_images)} validation images...")
+        
         for img_path, gt_path in zip(val_images, val_gt):
             # Load and preprocess image
             img = cv2.imread(img_path)
+            if img is None:
+                continue
+                
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (256, 256))
-            img = img.astype(np.float32) / 255.0
             
             # Load and preprocess ground truth
             gt = load_ground_truth(gt_path)
             if gt is None:
                 continue
-            gt = cv2.resize(gt, (256, 256))
-            gt = gt.astype(np.float32) / 255.0
-            gt = np.expand_dims(gt, axis=-1)
+                
+            # Resize and normalize
+            img_resized = cv2.resize(img, (256, 256))
+            gt_resized = cv2.resize(gt, (256, 256))
             
-            X_val.append(img)
-            y_val.append(gt)
+            img_norm = img_resized.astype(np.float32) / 255.0
+            gt_norm = gt_resized.astype(np.float32) / 255.0
+            gt_norm = np.expand_dims(gt_norm, axis=-1)
+            
+            X_val.append(img_norm)
+            y_val.append(gt_norm)
+            
+            # Add some smoky validation samples
+            if smoke_augmentation:
+                # Add one smoky version for validation
+                smoky_img = apply_smoke_effect(img, 2, 'perlin')  # Medium smoke
+                smoky_resized = cv2.resize(smoky_img, (256, 256))
+                smoky_norm = smoky_resized.astype(np.float32) / 255.0
+                
+                X_val.append(smoky_norm)
+                y_val.append(gt_norm)
         
         if X_val:
             X_val = np.array(X_val)
             y_val = np.array(y_val)
             validation_data = (X_val, y_val)
+            print(f"Created validation dataset with {len(X_val)} images")
     
-    # Set up data augmentation
+    # Set up data augmentation for clean images
     data_gen = ImageDataGenerator(
         rotation_range=10,
         width_shift_range=0.1,
         height_shift_range=0.1,
         zoom_range=0.1,
-        horizontal_flip=True
+        horizontal_flip=True,
+        brightness_range=[0.8, 1.2]
     )
     
     # Set up callbacks
@@ -948,4 +1011,367 @@ def sobel_edge_detection(image, ksize=3, threshold=0.1):
     Returns:
         Binary edge map
     """
-    return sobel_edge(image, threshold, ksize) 
+    return sobel_edge(image, threshold, ksize)
+
+def create_smoke_aware_edge_detection_model(input_shape=(256, 256, 3)):
+    """Create a model for edge detection that takes smoke level into account.
+    
+    This model has two inputs:
+    1. The image
+    2. The smoke level (one-hot encoded)
+    
+    Args:
+        input_shape: Input image shape
+        
+    Returns:
+        Keras model for edge detection
+    """
+    from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Reshape, Multiply
+
+    # Image input
+    img_input = Input(shape=input_shape, name='image_input')
+    
+    # Smoke level input (5 levels: none, light, medium, heavy, extreme)
+    smoke_level_input = Input(shape=(5,), name='smoke_level_input')
+    
+    # Initial convolution
+    x = Conv2D(64, 3, padding='same')(img_input)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    
+    # Encoder path with dense connections
+    skip_connections = []
+    
+    # Level 1
+    x1 = Conv2D(64, 3, padding='same')(x)
+    x1 = BatchNormalization()(x1)
+    x1 = Activation('relu')(x1)
+    skip_connections.append(x1)
+    x = MaxPooling2D(2)(x1)
+    
+    # Level 2
+    x2 = Conv2D(128, 3, padding='same')(x)
+    x2 = BatchNormalization()(x2)
+    x2 = Activation('relu')(x2)
+    x2 = Dropout(0.2)(x2)
+    x2 = Conv2D(128, 3, padding='same')(x2)
+    x2 = BatchNormalization()(x2)
+    x2 = Activation('relu')(x2)
+    skip_connections.append(x2)
+    x = MaxPooling2D(2)(x2)
+    
+    # Level 3
+    x3 = Conv2D(256, 3, padding='same')(x)
+    x3 = BatchNormalization()(x3)
+    x3 = Activation('relu')(x3)
+    x3 = Dropout(0.3)(x3)
+    x3 = Conv2D(256, 3, padding='same')(x3)
+    x3 = BatchNormalization()(x3)
+    x3 = Activation('relu')(x3)
+    skip_connections.append(x3)
+    x = MaxPooling2D(2)(x3)
+    
+    # Bridge
+    x = Conv2D(512, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Dropout(0.4)(x)
+    
+    # Incorporate smoke level information
+    # Convert smoke level to feature modulation
+    smoke_features = Dense(512, activation='relu')(smoke_level_input)
+    smoke_features = Dense(512, activation='sigmoid')(smoke_features)
+    smoke_features = Reshape((1, 1, 512))(smoke_features)
+    
+    # Apply feature modulation (adaptive scaling based on smoke level)
+    x = Multiply()([x, smoke_features])
+    
+    x = Conv2D(512, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    
+    # Decoder path with dense connections
+    skip_connections = skip_connections[::-1]  # Reverse for easy indexing
+    
+    # Level 3
+    x = UpSampling2D(2)(x)
+    x = Concatenate()([x, skip_connections[0]])
+    x = Conv2D(256, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Dropout(0.3)(x)
+    x = Conv2D(256, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    
+    # Level 2
+    x = UpSampling2D(2)(x)
+    x = Concatenate()([x, skip_connections[1]])
+    x = Conv2D(128, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Dropout(0.2)(x)
+    x = Conv2D(128, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    
+    # Level 1
+    x = UpSampling2D(2)(x)
+    x = Concatenate()([x, skip_connections[2]])
+    x = Conv2D(64, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv2D(64, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    
+    # Output
+    outputs = Conv2D(1, 1, padding='same', activation='sigmoid')(x)
+    
+    # Create model with two inputs
+    model = Model(inputs=[img_input, smoke_level_input], outputs=outputs)
+    model.compile(
+        optimizer='adam',
+        loss='binary_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    return model
+
+def train_smoke_aware_edge_detection_model(train_images, train_gt, val_images=None, val_gt=None, 
+                                         epochs=20, batch_size=8):
+    """Train the smoke-aware edge detection model.
+    
+    Args:
+        train_images: List of training image paths
+        train_gt: List of ground truth edge map paths
+        val_images: List of validation image paths (optional)
+        val_gt: List of validation ground truth edge map paths (optional)
+        epochs: Number of training epochs
+        batch_size: Batch size for training
+        
+    Returns:
+        Trained model
+    """
+    from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
+    from smoke_generation import apply_smoke_effect
+    
+    # Create model
+    model = create_smoke_aware_edge_detection_model()
+    
+    # Load and preprocess data
+    X_images = []
+    X_smoke_levels = []
+    y_gt = []
+    
+    print(f"Loading and processing {len(train_images)} training images with smoke augmentation...")
+    
+    for i, (img_path, gt_path) in enumerate(zip(train_images, train_gt)):
+        if i % 20 == 0:
+            print(f"Processing image {i}/{len(train_images)}")
+            
+        # Load and preprocess image
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"Failed to load image: {img_path}")
+            continue
+            
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Load and preprocess ground truth
+        gt = load_ground_truth(gt_path)
+        if gt is None:
+            print(f"Failed to load ground truth: {gt_path}")
+            continue
+            
+        # Resize images to model input size
+        img_resized = cv2.resize(img, (256, 256))
+        gt_resized = cv2.resize(gt, (256, 256))
+        
+        # Normalize to 0-1 range
+        img_norm = img_resized.astype(np.float32) / 255.0
+        gt_norm = gt_resized.astype(np.float32) / 255.0
+        gt_norm = np.expand_dims(gt_norm, axis=-1)  # Add channel dimension
+        
+        # Add the original clean image (smoke level 0 - none)
+        X_images.append(img_norm)
+        X_smoke_levels.append([1, 0, 0, 0, 0])  # One-hot encoding for 'none'
+        y_gt.append(gt_norm)
+        
+        # Generate different smoke levels
+        smoke_levels = [1, 2, 3, 4]  # light, medium, heavy, extreme
+        
+        # Create one-hot encodings for each level
+        smoke_level_encodings = {
+            1: [0, 1, 0, 0, 0],  # light
+            2: [0, 0, 1, 0, 0],  # medium
+            3: [0, 0, 0, 1, 0],  # heavy
+            4: [0, 0, 0, 0, 1]   # extreme
+        }
+        
+        # Add smoky versions with the same ground truth
+        for level in smoke_levels:
+            # Apply smoke effect with perlin noise
+            smoky_img = apply_smoke_effect(img, level, 'perlin')
+            
+            # Resize and normalize
+            smoky_resized = cv2.resize(smoky_img, (256, 256))
+            smoky_norm = smoky_resized.astype(np.float32) / 255.0
+            
+            # Add to training data with appropriate smoke level
+            X_images.append(smoky_norm)
+            X_smoke_levels.append(smoke_level_encodings[level])
+            y_gt.append(gt_norm)  # Same ground truth
+    
+    X_images = np.array(X_images)
+    X_smoke_levels = np.array(X_smoke_levels)
+    y_gt = np.array(y_gt)
+    
+    print(f"Created training dataset with {len(X_images)} images")
+    
+    # Prepare validation data if provided
+    validation_data = None
+    if val_images and val_gt:
+        val_X_images = []
+        val_X_smoke_levels = []
+        val_y_gt = []
+        
+        print(f"Loading and processing {len(val_images)} validation images...")
+        
+        for img_path, gt_path in zip(val_images, val_gt):
+            # Load and preprocess image
+            img = cv2.imread(img_path)
+            if img is None:
+                continue
+                
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Load and preprocess ground truth
+            gt = load_ground_truth(gt_path)
+            if gt is None:
+                continue
+                
+            # Resize and normalize
+            img_resized = cv2.resize(img, (256, 256))
+            gt_resized = cv2.resize(gt, (256, 256))
+            
+            img_norm = img_resized.astype(np.float32) / 255.0
+            gt_norm = gt_resized.astype(np.float32) / 255.0
+            gt_norm = np.expand_dims(gt_norm, axis=-1)
+            
+            # Add clean image
+            val_X_images.append(img_norm)
+            val_X_smoke_levels.append([1, 0, 0, 0, 0])  # none
+            val_y_gt.append(gt_norm)
+            
+            # Add one version with medium smoke
+            smoky_img = apply_smoke_effect(img, 2, 'perlin')
+            smoky_resized = cv2.resize(smoky_img, (256, 256))
+            smoky_norm = smoky_resized.astype(np.float32) / 255.0
+            
+            val_X_images.append(smoky_norm)
+            val_X_smoke_levels.append([0, 0, 1, 0, 0])  # medium
+            val_y_gt.append(gt_norm)
+        
+        if val_X_images:
+            val_X_images = np.array(val_X_images)
+            val_X_smoke_levels = np.array(val_X_smoke_levels)
+            val_y_gt = np.array(val_y_gt)
+            validation_data = ({'image_input': val_X_images, 'smoke_level_input': val_X_smoke_levels}, val_y_gt)
+            print(f"Created validation dataset with {len(val_X_images)} images")
+    
+    # Set up callbacks
+    callbacks = [
+        ModelCheckpoint(SMOKE_AWARE_MODEL_PATH, monitor='val_loss', save_best_only=True, mode='min'),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+    ]
+    
+    # Train model
+    print(f"Training smoke-aware edge detection model with {len(X_images)} images...")
+    history = model.fit(
+        {'image_input': X_images, 'smoke_level_input': X_smoke_levels},
+        y_gt,
+        epochs=epochs,
+        validation_data=validation_data,
+        callbacks=callbacks,
+        batch_size=batch_size
+    )
+    
+    # Load best model weights
+    if os.path.exists(SMOKE_AWARE_MODEL_PATH):
+        model = load_model(SMOKE_AWARE_MODEL_PATH)
+    
+    return model, history
+
+def smoke_aware_edge_detection(image, smoke_level, model=None):
+    """Apply smoke-aware edge detection to an image.
+    
+    Args:
+        image: RGB or grayscale image
+        smoke_level: Smoke level (0-4) or name ('none', 'light', etc.)
+        model: Pre-trained edge detection model (will load from disk if None)
+        
+    Returns:
+        Binary edge map
+    """
+    # Load model if not provided
+    if model is None:
+        if os.path.exists(SMOKE_AWARE_MODEL_PATH):
+            model = load_model(SMOKE_AWARE_MODEL_PATH)
+        else:
+            print("Error: No smoke-aware edge detection model found. Please train the model first.")
+            return None
+    
+    # Convert smoke level to string if it's a number
+    if isinstance(smoke_level, (int, float)):
+        smoke_levels = ['none', 'light', 'medium', 'heavy', 'extreme']
+        if 0 <= smoke_level < len(smoke_levels):
+            smoke_level_name = smoke_levels[int(smoke_level)]
+        else:
+            smoke_level_name = 'medium'  # Default
+    else:
+        smoke_level_name = smoke_level
+    
+    # Convert smoke level name to one-hot encoding
+    smoke_level_encoding = np.zeros(5)
+    if smoke_level_name == 'none':
+        smoke_level_encoding[0] = 1
+    elif smoke_level_name == 'light':
+        smoke_level_encoding[1] = 1
+    elif smoke_level_name == 'medium':
+        smoke_level_encoding[2] = 1
+    elif smoke_level_name == 'heavy':
+        smoke_level_encoding[3] = 1
+    elif smoke_level_name == 'extreme':
+        smoke_level_encoding[4] = 1
+    
+    # Preprocess input image
+    if len(image.shape) == 2:
+        # Convert grayscale to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    elif image.shape[2] > 3:
+        # Convert RGBA to RGB
+        image = image[:, :, :3]
+    
+    # Resize to model input size
+    original_size = image.shape[:2]
+    input_image = cv2.resize(image, (256, 256))
+    input_image = input_image.astype(np.float32) / 255.0
+    
+    # Add batch dimension
+    input_image = np.expand_dims(input_image, axis=0)
+    smoke_level_encoding = np.expand_dims(smoke_level_encoding, axis=0)
+    
+    # Predict edges
+    edge_pred = model.predict({
+        'image_input': input_image, 
+        'smoke_level_input': smoke_level_encoding
+    })[0, :, :, 0]
+    
+    # Resize back to original size
+    edge_pred = cv2.resize(edge_pred, (original_size[1], original_size[0]))
+    
+    # Thresholding for binary edges
+    edge_binary = (edge_pred > 0.5).astype(np.float32)
+    
+    return edge_binary 
