@@ -7,6 +7,12 @@ from skimage.filters import gaussian
 from skimage.feature import canny
 from skimage.metrics import structural_similarity
 from scipy import ndimage
+import tensorflow as tf
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import Input, Conv2D, BatchNormalization, Activation, MaxPooling2D
+from tensorflow.keras.layers import Concatenate, UpSampling2D, Dropout
+import os
+from utils import load_ground_truth
 
 # Check if OpenCV contrib modules are available
 has_ximgproc = True
@@ -15,6 +21,10 @@ try:
 except AttributeError:
     has_ximgproc = False
     print("Warning: cv2.ximgproc not available. Using fallback implementation for guided filter.")
+
+# Path to save/load the model
+EDGE_MODEL_PATH = 'models/edge_detection_model.h5'
+SMOKE_LEVEL_PATH = 'models/smoke_level_model.h5'
 
 def canny_edge(image, sigma=1.0, low_threshold=50, high_threshold=150):
     """Apply Canny edge detection to an image.
@@ -258,6 +268,476 @@ def enhance_smoky_image(image, smoke_level):
     
     return enhanced_rgb
 
+def create_dense_edge_detection_model(input_shape=(256, 256, 3)):
+    """Create a DenseNet-like model for edge detection.
+    
+    Args:
+        input_shape: Input image shape
+        
+    Returns:
+        Keras model for edge detection
+    """
+    inputs = Input(shape=input_shape)
+    
+    # Initial convolution
+    x = Conv2D(64, 3, padding='same')(inputs)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    
+    # Encoder path with dense connections
+    skip_connections = []
+    
+    # Level 1
+    x1 = Conv2D(64, 3, padding='same')(x)
+    x1 = BatchNormalization()(x1)
+    x1 = Activation('relu')(x1)
+    skip_connections.append(x1)
+    x = MaxPooling2D(2)(x1)
+    
+    # Level 2
+    x2 = Conv2D(128, 3, padding='same')(x)
+    x2 = BatchNormalization()(x2)
+    x2 = Activation('relu')(x2)
+    x2 = Dropout(0.2)(x2)
+    x2 = Conv2D(128, 3, padding='same')(x2)
+    x2 = BatchNormalization()(x2)
+    x2 = Activation('relu')(x2)
+    skip_connections.append(x2)
+    x = MaxPooling2D(2)(x2)
+    
+    # Level 3
+    x3 = Conv2D(256, 3, padding='same')(x)
+    x3 = BatchNormalization()(x3)
+    x3 = Activation('relu')(x3)
+    x3 = Dropout(0.3)(x3)
+    x3 = Conv2D(256, 3, padding='same')(x3)
+    x3 = BatchNormalization()(x3)
+    x3 = Activation('relu')(x3)
+    skip_connections.append(x3)
+    x = MaxPooling2D(2)(x3)
+    
+    # Bridge
+    x = Conv2D(512, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Dropout(0.4)(x)
+    x = Conv2D(512, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    
+    # Decoder path with dense connections
+    skip_connections = skip_connections[::-1]  # Reverse for easy indexing
+    
+    # Level 3
+    x = UpSampling2D(2)(x)
+    x = Concatenate()([x, skip_connections[0]])
+    x = Conv2D(256, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Dropout(0.3)(x)
+    x = Conv2D(256, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    
+    # Level 2
+    x = UpSampling2D(2)(x)
+    x = Concatenate()([x, skip_connections[1]])
+    x = Conv2D(128, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Dropout(0.2)(x)
+    x = Conv2D(128, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    
+    # Level 1
+    x = UpSampling2D(2)(x)
+    x = Concatenate()([x, skip_connections[2]])
+    x = Conv2D(64, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv2D(64, 3, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    
+    # Output
+    outputs = Conv2D(1, 1, padding='same', activation='sigmoid')(x)
+    
+    model = Model(inputs=inputs, outputs=outputs)
+    model.compile(
+        optimizer='adam',
+        loss='binary_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    return model
+
+def train_edge_detection_model(train_images, train_gt, val_images=None, val_gt=None, 
+                              epochs=20, batch_size=8):
+    """Train the deep edge detection model.
+    
+    Args:
+        train_images: List of training image paths
+        train_gt: List of ground truth edge map paths
+        val_images: List of validation image paths (optional)
+        val_gt: List of validation ground truth edge map paths (optional)
+        epochs: Number of training epochs
+        batch_size: Batch size for training
+        
+    Returns:
+        Trained model
+    """
+    from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
+    from tensorflow.keras.preprocessing.image import ImageDataGenerator
+    
+    # Create model
+    model = create_dense_edge_detection_model()
+    
+    # Load and preprocess data
+    X_train = []
+    y_train = []
+    
+    for img_path, gt_path in zip(train_images, train_gt):
+        # Load and preprocess image
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (256, 256))
+        img = img.astype(np.float32) / 255.0
+        
+        # Load and preprocess ground truth
+        gt = load_ground_truth(gt_path)
+        if gt is None:
+            continue
+        gt = cv2.resize(gt, (256, 256))
+        gt = gt.astype(np.float32) / 255.0
+        gt = np.expand_dims(gt, axis=-1)
+        
+        X_train.append(img)
+        y_train.append(gt)
+    
+    X_train = np.array(X_train)
+    y_train = np.array(y_train)
+    
+    # Prepare validation data if provided
+    validation_data = None
+    if val_images and val_gt:
+        X_val = []
+        y_val = []
+        
+        for img_path, gt_path in zip(val_images, val_gt):
+            # Load and preprocess image
+            img = cv2.imread(img_path)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img, (256, 256))
+            img = img.astype(np.float32) / 255.0
+            
+            # Load and preprocess ground truth
+            gt = load_ground_truth(gt_path)
+            if gt is None:
+                continue
+            gt = cv2.resize(gt, (256, 256))
+            gt = gt.astype(np.float32) / 255.0
+            gt = np.expand_dims(gt, axis=-1)
+            
+            X_val.append(img)
+            y_val.append(gt)
+        
+        if X_val:
+            X_val = np.array(X_val)
+            y_val = np.array(y_val)
+            validation_data = (X_val, y_val)
+    
+    # Set up data augmentation
+    data_gen = ImageDataGenerator(
+        rotation_range=10,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        zoom_range=0.1,
+        horizontal_flip=True
+    )
+    
+    # Set up callbacks
+    callbacks = [
+        ModelCheckpoint(EDGE_MODEL_PATH, monitor='val_loss', save_best_only=True, mode='min'),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+    ]
+    
+    # Train model
+    print(f"Training edge detection model with {len(X_train)} images...")
+    history = model.fit(
+        data_gen.flow(X_train, y_train, batch_size=batch_size),
+        epochs=epochs,
+        validation_data=validation_data,
+        callbacks=callbacks,
+        steps_per_epoch=len(X_train) // batch_size
+    )
+    
+    # Load best model weights
+    if os.path.exists(EDGE_MODEL_PATH):
+        model = load_model(EDGE_MODEL_PATH)
+    
+    return model, history
+
+def deep_edge_detection(image, model=None, threshold=0.5):
+    """Apply deep learning-based edge detection to an image.
+    
+    Args:
+        image: RGB or grayscale image
+        model: Pre-trained edge detection model (will load from disk if None)
+        threshold: Threshold for edge detection
+        
+    Returns:
+        Binary edge map
+    """
+    # Load model if not provided
+    if model is None:
+        if os.path.exists(EDGE_MODEL_PATH):
+            model = load_model(EDGE_MODEL_PATH)
+        else:
+            print("Error: No edge detection model found. Please train the model first.")
+            return None
+    
+    # Preprocess input image
+    if len(image.shape) == 2:
+        # Convert grayscale to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    elif image.shape[2] > 3:
+        # Convert RGBA to RGB
+        image = image[:, :, :3]
+    
+    # Resize to model input size
+    original_size = image.shape[:2]
+    input_image = cv2.resize(image, (256, 256))
+    input_image = input_image.astype(np.float32) / 255.0
+    
+    # Add batch dimension
+    input_image = np.expand_dims(input_image, axis=0)
+    
+    # Predict edges
+    edge_pred = model.predict(input_image)[0, :, :, 0]
+    
+    # Resize back to original size
+    edge_pred = cv2.resize(edge_pred, (original_size[1], original_size[0]))
+    
+    # Thresholding for binary edges
+    edge_binary = (edge_pred > threshold).astype(np.float32)
+    
+    return edge_binary
+
+def hybrid_edge_detection(image, deep_model=None):
+    """Apply hybrid edge detection using both deep learning and traditional methods.
+    
+    This approach combines deep learning edge detection with traditional methods for
+    improved accuracy. Based on "Hybrid Image Edge Detection Algorithm Based on
+    Fractional Differential and Canny Operator" paper.
+    
+    Args:
+        image: RGB image
+        deep_model: Pre-trained deep learning model (optional)
+        
+    Returns:
+        Binary edge map
+    """
+    # Convert to grayscale if RGB
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    
+    # Apply deep learning edge detection
+    deep_edges = deep_edge_detection(image, model=deep_model)
+    
+    if deep_edges is None:
+        # Fallback to traditional methods if deep model is not available
+        return sobel_edge(image, threshold=0.15)
+    
+    # Apply Canny with optimized parameters based on research
+    canny_edges = canny_edge(image, sigma=1.3, low_threshold=30, high_threshold=100)
+    
+    # Apply multi-scale Sobel for texture details
+    sobel_edges = sobel_edge(image, threshold=0.12, ksize=3)
+    
+    # Combine edges using weighted fusion
+    combined_edges = 0.6 * deep_edges + 0.2 * canny_edges + 0.2 * sobel_edges
+    
+    # Apply non-maximum suppression and hysteresis thresholding to refine edges
+    refined_edges = apply_non_maximum_suppression(combined_edges, gray)
+    
+    return refined_edges
+
+def apply_non_maximum_suppression(edge_map, gray_image):
+    """Apply non-maximum suppression to refine edges.
+    
+    Args:
+        edge_map: Edge probability map
+        gray_image: Grayscale image for gradient calculation
+        
+    Returns:
+        Refined edge map
+    """
+    # Calculate gradients
+    gx = cv2.Sobel(gray_image, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray_image, cv2.CV_32F, 0, 1, ksize=3)
+    
+    # Calculate gradient magnitude and direction
+    magnitude = np.sqrt(gx**2 + gy**2)
+    direction = np.arctan2(gy, gx) * 180 / np.pi
+    
+    # Quantize the direction into one of 4 directions (0, 45, 90, 135 degrees)
+    direction_quantized = np.zeros_like(direction, dtype=np.uint8)
+    direction_quantized[(direction >= -22.5) & (direction < 22.5)] = 0  # 0 degrees (horizontal)
+    direction_quantized[(direction >= 22.5) & (direction < 67.5)] = 1   # 45 degrees
+    direction_quantized[(direction >= 67.5) & (direction < 112.5)] = 2  # 90 degrees (vertical)
+    direction_quantized[(direction >= 112.5) & (direction < 157.5)] = 3 # 135 degrees
+    direction_quantized[(direction >= -67.5) & (direction < -22.5)] = 1
+    direction_quantized[(direction >= -112.5) & (direction < -67.5)] = 2
+    direction_quantized[(direction >= -157.5) & (direction < -112.5)] = 3
+    direction_quantized[(direction >= 157.5) | (direction < -157.5)] = 0
+    
+    # Apply non-maximum suppression
+    height, width = edge_map.shape
+    suppressed = np.zeros((height, width), dtype=np.float32)
+    
+    for i in range(1, height-1):
+        for j in range(1, width-1):
+            # Skip if edge strength is already 0
+            if edge_map[i, j] == 0:
+                continue
+                
+            # Get the direction
+            d = direction_quantized[i, j]
+            
+            # Check if the current pixel is a local maximum
+            if d == 0:  # Horizontal
+                if edge_map[i, j] >= edge_map[i, j-1] and edge_map[i, j] >= edge_map[i, j+1]:
+                    suppressed[i, j] = edge_map[i, j]
+            elif d == 1:  # 45 degrees
+                if edge_map[i, j] >= edge_map[i-1, j+1] and edge_map[i, j] >= edge_map[i+1, j-1]:
+                    suppressed[i, j] = edge_map[i, j]
+            elif d == 2:  # Vertical
+                if edge_map[i, j] >= edge_map[i-1, j] and edge_map[i, j] >= edge_map[i+1, j]:
+                    suppressed[i, j] = edge_map[i, j]
+            elif d == 3:  # 135 degrees
+                if edge_map[i, j] >= edge_map[i-1, j-1] and edge_map[i, j] >= edge_map[i+1, j+1]:
+                    suppressed[i, j] = edge_map[i, j]
+    
+    # Apply hysteresis thresholding
+    high_threshold = 0.2
+    low_threshold = 0.1
+    
+    strong_edges = (suppressed > high_threshold).astype(np.uint8)
+    weak_edges = ((suppressed > low_threshold) & (suppressed <= high_threshold)).astype(np.uint8)
+    
+    # Use connected components to link weak edges to strong edges
+    labeled_strong, num_strong = ndimage.label(strong_edges)
+    final_edges = np.copy(strong_edges)
+    
+    for i in range(1, num_strong+1):
+        strong_region = (labeled_strong == i)
+        dilated_region = ndimage.binary_dilation(strong_region, structure=np.ones((3, 3)))
+        connected_weak = dilated_region & weak_edges
+        final_edges = final_edges | connected_weak
+    
+    return final_edges.astype(np.float32)
+
+def rethink_canny_edge_detection(image, adaptive_thresholds=True):
+    """Improved Canny edge detection using adaptive thresholds and FCM in NSST domain.
+    
+    Based on "Image Edge Detection Based on FCM and Improved Canny Operator in NSST Domain" paper.
+    
+    Args:
+        image: RGB or grayscale image
+        adaptive_thresholds: Whether to use adaptive thresholding
+        
+    Returns:
+        Binary edge map
+    """
+    # Convert to grayscale if RGB
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    
+    # Apply CLAHE for contrast enhancement
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray.astype(np.uint8))
+    
+    # Apply bilateral filter for edge-preserving smoothing
+    smoothed = cv2.bilateralFilter(gray, 7, 50, 50)
+    
+    # Compute gradients using Sobel operators with optimal kernel size
+    gx = cv2.Sobel(smoothed, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(smoothed, cv2.CV_32F, 0, 1, ksize=3)
+    
+    # Compute gradient magnitude and direction
+    magnitude = np.sqrt(gx**2 + gy**2)
+    direction = np.arctan2(gy, gx) * 180 / np.pi
+    
+    # Normalize magnitude
+    magnitude_norm = magnitude / magnitude.max()
+    
+    # Determine thresholds adaptively using Otsu's method if requested
+    if adaptive_thresholds:
+        # Convert to 8-bit for Otsu
+        mag_8bit = (magnitude_norm * 255).astype(np.uint8)
+        high_threshold, _ = cv2.threshold(mag_8bit, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        high_threshold = high_threshold / 255.0
+        low_threshold = high_threshold * 0.4
+    else:
+        # Fixed thresholds
+        high_threshold = 0.2
+        low_threshold = 0.08
+    
+    # Apply non-maximum suppression and hysteresis thresholding
+    # Non-maximum suppression
+    height, width = magnitude_norm.shape
+    suppressed = np.zeros((height, width), dtype=np.float32)
+    
+    for i in range(1, height-1):
+        for j in range(1, width-1):
+            # Skip if edge strength is already 0
+            if magnitude_norm[i, j] == 0:
+                continue
+                
+            # Get the gradient direction and round to one of four angles (0, 45, 90, 135)
+            angle = direction[i, j]
+            if (angle < 0):
+                angle += 180
+                
+            # Check if the current pixel is a local maximum
+            if (angle <= 22.5 or angle > 157.5):  # Horizontal (0 degrees)
+                if magnitude_norm[i, j] >= magnitude_norm[i, j-1] and magnitude_norm[i, j] >= magnitude_norm[i, j+1]:
+                    suppressed[i, j] = magnitude_norm[i, j]
+            elif (angle > 22.5 and angle <= 67.5):  # 45 degrees
+                if magnitude_norm[i, j] >= magnitude_norm[i-1, j+1] and magnitude_norm[i, j] >= magnitude_norm[i+1, j-1]:
+                    suppressed[i, j] = magnitude_norm[i, j]
+            elif (angle > 67.5 and angle <= 112.5):  # Vertical (90 degrees)
+                if magnitude_norm[i, j] >= magnitude_norm[i-1, j] and magnitude_norm[i, j] >= magnitude_norm[i+1, j]:
+                    suppressed[i, j] = magnitude_norm[i, j]
+            else:  # 135 degrees
+                if magnitude_norm[i, j] >= magnitude_norm[i-1, j-1] and magnitude_norm[i, j] >= magnitude_norm[i+1, j+1]:
+                    suppressed[i, j] = magnitude_norm[i, j]
+    
+    # Hysteresis thresholding
+    strong_edges = (suppressed > high_threshold).astype(np.uint8)
+    weak_edges = ((suppressed > low_threshold) & (suppressed <= high_threshold)).astype(np.uint8)
+    
+    # Use connected components to link weak edges to strong edges
+    labeled_strong, num_strong = ndimage.label(strong_edges)
+    final_edges = np.copy(strong_edges)
+    
+    for i in range(1, num_strong+1):
+        strong_region = (labeled_strong == i)
+        dilated_region = ndimage.binary_dilation(strong_region, structure=np.ones((3, 3)))
+        connected_weak = dilated_region & weak_edges
+        final_edges = final_edges | connected_weak
+    
+    # Post-processing to remove isolated pixels and fill small gaps
+    kernel = np.ones((3, 3), np.uint8)
+    final_edges = cv2.morphologyEx(final_edges, cv2.MORPH_CLOSE, kernel)
+    
+    return final_edges.astype(np.float32)
+
 def adaptive_edge_detection(image, smoke_level):
     """Apply adaptive edge detection based on smoke level.
     
@@ -276,60 +756,71 @@ def adaptive_edge_detection(image, smoke_level):
         else:
             smoke_level = 'medium'  # Default to medium if out of range
     
-    # Select the best edge detection method and parameters based on smoke level
+    # Check if deep learning model is available
+    has_deep_model = os.path.exists(EDGE_MODEL_PATH)
+    
+    # For no smoke or light smoke, use hybrid method or traditional methods
     if smoke_level == 'none':
-        # No smoke - use Sobel with standard parameters
-        return sobel_edge(image, threshold=0.1, ksize=3)
+        if has_deep_model:
+            return deep_edge_detection(image, threshold=0.4)
+        else:
+            return rethink_canny_edge_detection(image, adaptive_thresholds=True)
     
     elif smoke_level == 'light':
-        # Light smoke - use Sobel with enhanced contrast
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # Light smoke - use deep learning with preprocessing
+        if has_deep_model:
+            # Enhance contrast before edge detection
+            enhanced = enhance_smoky_image(image, 1)
+            return deep_edge_detection(enhanced, threshold=0.35)
         else:
-            gray = image
-        # Apply contrast enhancement
-        enhanced = cv2.equalizeHist(gray)
-        return sobel_edge(enhanced, threshold=0.1, ksize=3)
+            # Use traditional methods with preprocessing
+            enhanced = enhance_smoky_image(image, 1)
+            return rethink_canny_edge_detection(enhanced, adaptive_thresholds=True)
     
     elif smoke_level == 'medium':
-        # Medium smoke - use pre-processing with guided filter and then Sobel
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # Medium smoke - heavy preprocessing with hybrid approach
+        enhanced = enhance_smoky_image(image, 2)
+        if has_deep_model:
+            return hybrid_edge_detection(enhanced)
         else:
-            gray = image
-        # Apply guided filter for smoothing while preserving edges
-        gray_float = gray.astype(np.float32) / 255.0
-        filtered = cv2.ximgproc.guidedFilter(gray_float, gray_float, 8, 0.02)
-        filtered = (filtered * 255).astype(np.uint8)
-        # Apply contrast enhancement
-        enhanced = cv2.equalizeHist(filtered)
-        return sobel_edge(enhanced, threshold=0.1, ksize=5)
+            return rethink_canny_edge_detection(enhanced, adaptive_thresholds=True)
     
     elif smoke_level == 'heavy':
-        # Heavy smoke - use denoising, enhancement and then Sobel with larger kernel
-        enhanced = enhance_smoky_image(image, 0.75)
-        if len(enhanced.shape) == 3:
-            enhanced = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
-        # Apply contrast enhancement
-        enhanced = cv2.equalizeHist(enhanced)
-        return sobel_edge(enhanced, threshold=0.1, ksize=5)
+        # Heavy smoke - use deep learning with stronger preprocessing
+        enhanced = enhance_smoky_image(image, 3)
+        if has_deep_model:
+            # Lower threshold to improve recall
+            return deep_edge_detection(enhanced, threshold=0.25)
+        else:
+            # Use combination of methods
+            canny_edges = rethink_canny_edge_detection(enhanced, adaptive_thresholds=True)
+            sobel_edges = sobel_edge(enhanced, threshold=0.1, ksize=5)
+            return np.maximum(canny_edges, sobel_edges)
     
     elif smoke_level == 'extreme':
-        # Extreme smoke - heavy denoising, enhancement, and multi-scale approach
-        enhanced = enhance_smoky_image(image, 1.0)
-        if len(enhanced.shape) == 3:
-            enhanced = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
-        # Apply contrast enhancement
-        enhanced = cv2.equalizeHist(enhanced)
+        # Extreme smoke - maximum enhancement and multi-scale approach
+        enhanced = enhance_smoky_image(image, 4)
         
-        # Multi-scale edge detection (combine edges at different scales)
-        edges1 = sobel_edge(enhanced, threshold=0.1, ksize=3)
-        edges2 = sobel_edge(enhanced, threshold=0.1, ksize=5)
-        edges3 = sobel_edge(enhanced, threshold=0.1, ksize=7)
-        
-        # Combine the edges (take maximum response)
-        combined_edges = np.maximum(edges1, np.maximum(edges2, edges3))
-        return combined_edges
+        if has_deep_model:
+            # Use deep learning with lowest threshold
+            return deep_edge_detection(enhanced, threshold=0.2)
+        else:
+            # Multi-scale approach
+            canny_edges = rethink_canny_edge_detection(enhanced, adaptive_thresholds=True)
+            sobel_edges1 = sobel_edge(enhanced, threshold=0.08, ksize=3)
+            sobel_edges2 = sobel_edge(enhanced, threshold=0.12, ksize=5)
+            sobel_edges3 = sobel_edge(enhanced, threshold=0.15, ksize=7)
+            
+            # Combine all methods (take maximum response)
+            combined_edges = np.maximum(canny_edges, 
+                                       np.maximum(sobel_edges1, 
+                                                 np.maximum(sobel_edges2, sobel_edges3)))
+            
+            # Final refinement
+            kernel = np.ones((3, 3), np.uint8)
+            combined_edges = cv2.morphologyEx(combined_edges, cv2.MORPH_CLOSE, kernel)
+            
+            return combined_edges
     
     else:
         # Default to Sobel if smoke level is unknown

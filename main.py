@@ -9,13 +9,16 @@ import tensorflow as tf
 np.random.seed(42)
 random.seed(42)
 tf.random.set_seed(42)
+from tensorflow.keras.models import Model, load_model
 
 # Import project modules
 from utils import load_dataset, setup_directories, find_corresponding_gt, load_ground_truth
 from smoke_generation import create_smoky_dataset
 from edge_detection import (
     canny_edge, sobel_edge, laplacian_edge, guided_filter_edge, 
-    enhance_smoky_image, adaptive_edge_detection
+    enhance_smoky_image, adaptive_edge_detection, deep_edge_detection,
+    hybrid_edge_detection, rethink_canny_edge_detection, train_edge_detection_model,
+    EDGE_MODEL_PATH, SMOKE_LEVEL_PATH
 )
 from smoke_level_model import (
     train_smoke_level_model, predict_smoke_level
@@ -44,23 +47,37 @@ def main():
     test_subset = train_images[:20]  # Use 20 images for demonstration
     smoky_dataset = create_smoky_dataset(test_subset, methods=['perlin', 'gaussian', 'texture'])
     
-    # Display some smoke-augmented images
+    # Display some smoke-augmented samples
     show_smoke_augmented_samples(smoky_dataset, 2)
     
+    # First train the edge detection model if it doesn't exist
+    if not os.path.exists(EDGE_MODEL_PATH):
+        print("\nTraining deep learning edge detection model...")
+        edge_model, _ = train_edge_detection_model(
+            train_images, train_gt,
+            val_images, val_gt,
+            epochs=20,
+            batch_size=8
+        )
+
     # Test edge detection on smoky images
     print("\nTesting edge detection algorithms on smoky images...")
     test_edge_detection_on_smoke_levels(smoky_dataset, gt_dir)
-    
+
     # Train smoke level estimation model with improved parameters
     print("\nTraining smoke level estimation model...")
     # Use transfer learning and more epochs for better accuracy
-    smoke_model, _ = train_smoke_level_model(
-        smoky_dataset, 
-        epochs=20,  # Increased epochs
-        batch_size=8,  # Smaller batch size for better generalization
-        use_transfer_learning=True
-    )
-    
+    if not os.path.exists(SMOKE_LEVEL_PATH):
+        smoke_model, _ = train_smoke_level_model(
+            smoky_dataset,
+            model_save_path=SMOKE_LEVEL_PATH,
+            epochs=20,  # Increased epochs
+            batch_size=8,  # Smaller batch size for better generalization
+            use_transfer_learning=True
+        )
+    else:
+        smoke_model = load_model(SMOKE_LEVEL_PATH)
+
     # Test adaptive edge detection
     print("\nTesting adaptive edge detection system...")
     test_adaptive_edge_detection(smoky_dataset, smoke_model, gt_dir)
@@ -111,6 +128,9 @@ def test_edge_detection_on_smoke_levels(dataset, gt_dir):
     variations = [item for item in dataset if item['original_path'] == sample_image_path]
     variations.sort(key=lambda x: x['smoke_level'])  # Sort by smoke level
     
+    # Check if deep learning model is available
+    has_deep_model = os.path.exists(EDGE_MODEL_PATH)
+    
     # Compare edge detection for each smoke level
     for variation in variations:
         print(f"\nTesting edge detection on {variation['smoke_level_name']} smoke ({variation['smoke_method']})")
@@ -125,9 +145,26 @@ def test_edge_detection_on_smoke_levels(dataset, gt_dir):
             'guided': guided_filter_edge(image, radius=10, eps=0.25**2, threshold=0.25)
         }
         
+        # Add deep learning methods if available
+        if has_deep_model:
+            # Load deep model
+            model = tf.keras.models.load_model(EDGE_MODEL_PATH)
+            
+            # Add deep learning methods
+            edges['deep'] = deep_edge_detection(image, model=model, threshold=0.4)
+            edges['hybrid'] = hybrid_edge_detection(image, deep_model=model)
+            
+            # Use method names for comparison
+            method_names = ['Canny', 'Sobel', 'Laplacian', 'Guided Filter', 'Deep Learning', 'Hybrid']
+        else:
+            # Add the improved traditional method
+            edges['improved_canny'] = rethink_canny_edge_detection(image, adaptive_thresholds=True)
+            
+            # Use method names for comparison
+            method_names = ['Canny', 'Sobel', 'Laplacian', 'Guided Filter', 'Improved Canny']
+        
         # Compare methods
-        compare_methods(variation['smoky_path'], gt_path, edges, 
-                       ['Canny', 'Sobel', 'Laplacian', 'Guided Filter'])
+        compare_methods(variation['smoky_path'], gt_path, edges, method_names)
 
 def test_adaptive_edge_detection(smoky_dataset, smoke_model, gt_dir):
     """Test adaptive edge detection system with smoke level prediction.
@@ -254,6 +291,11 @@ def compare_all_methods(dataset, smoke_model, gt_dir, num_samples=3):
         )
         selected_samples.extend(remaining)
     
+    # Check if deep learning model is available
+    has_deep_model = os.path.exists(EDGE_MODEL_PATH)
+    if has_deep_model:
+        model = tf.keras.models.load_model(EDGE_MODEL_PATH)
+    
     for item in selected_samples:
         # Find corresponding ground truth
         gt_path = find_corresponding_gt(item['original_path'], gt_dir)
@@ -285,19 +327,18 @@ def compare_all_methods(dataset, smoke_model, gt_dir, num_samples=3):
         predicted_level = smoke_levels[predicted_level_idx]
         print(f"Predicted level: {predicted_level} (confidence: {confidence:.2f}), Actual level: {item['smoke_level_name']}")
         
-        # Apply different methods with improved parameters
-        canny_edges = canny_edge(image, sigma=1.5, low_threshold=40, high_threshold=120)
-        sobel_edges = sobel_edge(image, threshold=0.15)
-        guided_edges = guided_filter_edge(image, radius=10, eps=0.25**2, threshold=0.25)
-        adaptive_edges = adaptive_edge_detection(image, predicted_level)
-        
-        # Evaluate all methods
+        # Apply different edge detection methods
         methods = {
-            'canny': canny_edges,
-            'sobel': sobel_edges,
-            'guided': guided_edges,
-            'adaptive': adaptive_edges
+            'canny': canny_edge(image, sigma=1.5, low_threshold=40, high_threshold=120),
+            'sobel': sobel_edge(image, threshold=0.15),
+            'improved_canny': rethink_canny_edge_detection(image, adaptive_thresholds=True),
+            'adaptive': adaptive_edge_detection(image, predicted_level)
         }
+        
+        # Add deep learning methods if available
+        if has_deep_model:
+            methods['deep'] = deep_edge_detection(image, model=model, threshold=0.4)
+            methods['hybrid'] = hybrid_edge_detection(image, deep_model=model)
         
         # Calculate and display metrics
         print("\n" + "="*50)
@@ -328,18 +369,24 @@ def compare_all_methods(dataset, smoke_model, gt_dir, num_samples=3):
     # Calculate average metrics across all test images
     if results:
         avg_metrics = {method: {'precision': 0, 'recall': 0, 'f1': 0, 'iou': 0, 'ssim': 0} 
-                      for method in ['canny', 'sobel', 'guided', 'adaptive']}
+                      for method in ['canny', 'sobel', 'improved_canny', 'adaptive']}
+        
+        # Add deep learning methods if available
+        if has_deep_model:
+            avg_metrics['deep'] = {'precision': 0, 'recall': 0, 'f1': 0, 'iou': 0, 'ssim': 0}
+            avg_metrics['hybrid'] = {'precision': 0, 'recall': 0, 'f1': 0, 'iou': 0, 'ssim': 0}
         
         # Create counters for each method to handle cases where not all metrics are present
         method_counts = {method: 0 for method in avg_metrics.keys()}
         
         for result in results:
             for method, metrics in result['metrics'].items():
-                method_counts[method] += 1
-                for metric_name, value in metrics.items():
-                    # Only include the standard metrics
-                    if metric_name in avg_metrics[method]:
-                        avg_metrics[method][metric_name] += value
+                if method in method_counts:
+                    method_counts[method] += 1
+                    for metric_name, value in metrics.items():
+                        # Only include the standard metrics
+                        if metric_name in avg_metrics[method]:
+                            avg_metrics[method][metric_name] += value
         
         # Calculate averages
         for method in avg_metrics:
